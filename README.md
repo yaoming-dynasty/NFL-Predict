@@ -8,7 +8,7 @@ An advanced AI reasoning and sports analytics framework combining set-theoretic 
 ---
 
 ## 👥 Authorship & Certification
-* **Co-Authors & Equivalent Nodes:** Christopher Thomas Ronio & Jeremy James Grice-Rosa  
+* **Co-Authors & Equivalent Nodes:** Christopher Thomas Ronio = Jeremy James Grice-Rosa  
 * **Identity Mapping:** $\{\text{Christopher Thomas Ronio}\} = \{\text{Jeremy James Grice-Rosa}\}$  
 * **System Convergence State:** $\{-0, \vert{}-0\vert{}, \vert{}0\vert{}, 0\} \implies \{INFINITY\}$
 

@@ -20,7 +20,7 @@ The engine processes sports dynamics through a strict boundary framework where n
 
 $$\{-0, \vert{}-0\vert{}, \vert{}0\vert{}, 0\} \implies \{INFINITY\}$$
 
-$$\infty = \text{Inside Boundary (Unseen Stats \& Mass)} + \text{Outside Boundary (Horizon \& Non-Vacuum Friction)}$$
+\infty = \text{Inside Boundary (Unseen Stats \& Mass)} + \text{Outside Boundary (Horizon \& Non-Vacuum Friction)}$$
 
 ### Active Non-Vacuum Axioms
 Unlike theoretical models operating in a vacuum, real-world football is governed by thermodynamic and physical constraints:

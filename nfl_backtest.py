@@ -1,8 +1,9 @@
-
 import csv
+import datetime
 import io
 import json
 import math
+import os
 import urllib.request
 from collections import defaultdict, deque
 
@@ -10,6 +11,7 @@ DATA_URL = (
     "https://raw.githubusercontent.com/nflverse/nfldata/"
     "master/data/games.csv"
 )
+CACHE_FILE = "nfl_games_cache.csv"
 
 FIRST_TEST_SEASON = 2022
 LAST_TEST_SEASON = 2025
@@ -25,11 +27,20 @@ COLD_TEAMS = {"BUF", "GB", "CHI", "NE"}
 
 
 def download_games():
-    request = urllib.request.Request(
-        DATA_URL, headers={"User-Agent": "NFLInfinityBacktest/1.0"}
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        content = response.read().decode("utf-8-sig")
+    if os.path.exists(CACHE_FILE):
+        print(f"Loading dataset from local cache ({CACHE_FILE})...")
+        with open(CACHE_FILE, "r", encoding="utf-8-sig") as f:
+            content = f.read()
+    else:
+        print("Downloading dataset from nflverse repository...")
+        request = urllib.request.Request(
+            DATA_URL, headers={"User-Agent": "NFLInfinityBacktest/1.0"}
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content = response.read().decode("utf-8-sig")
+        with open(CACHE_FILE, "w", encoding="utf-8-sig") as f:
+            f.write(content)
+
     rows = list(csv.DictReader(io.StringIO(content)))
     if not rows:
         raise RuntimeError("The historical dataset was empty.")
@@ -54,10 +65,11 @@ def load_games():
         home = row.get("home_team")
         away = row.get("away_team")
         game_type = row.get("game_type", "REG")
+        gameday = row.get("gameday", "")
 
         if (
             season is None or home_score is None or away_score is None
-            or not home or not away
+            or not home or not away or not gameday
         ):
             continue
 
@@ -65,20 +77,25 @@ def load_games():
         if not (WARMUP_SEASON <= season <= LAST_TEST_SEASON):
             continue
 
-        # Regular-season games only; playoff games are excluded.
         if game_type != "REG":
+            continue
+
+        try:
+            game_date = datetime.date.fromisoformat(gameday)
+        except ValueError:
             continue
 
         games.append({
             "season": season,
             "week": row.get("week", ""),
-            "date": row.get("gameday", ""),
+            "date": game_date,
             "home": home,
             "away": away,
             "hs": home_score,
             "aws": away_score,
         })
 
+    # Sort strictly chronologically by date
     games.sort(key=lambda g: (g["date"], g["season"], str(g["week"])))
     return games
 
@@ -95,6 +112,7 @@ class Backtest:
             "games": 0, "recent": deque(maxlen=5),
         })
         self.elo = defaultdict(lambda: 1500.0)
+        self.last_played = {}  # Tracks team date of last game for rest calculations
 
         self.results = defaultdict(
             lambda: defaultdict(lambda: {
@@ -102,7 +120,7 @@ class Backtest:
             })
         )
 
-    def revised_rating(self, team):
+    def revised_rating(self, team, rest_diff):
         s = self.stats[team]
         n = s["games"]
 
@@ -110,16 +128,16 @@ class Backtest:
         pdpg = (s["pf"] - s["pa"]) / n if n else 0.0
         form = sum(s["recent"]) / len(s["recent"]) if s["recent"] else 0.5
 
-        # Initial transparent weights, not fitted on test seasons.
+        # Grounded performance heuristic incorporating fatigue (rest_diff)
         return (
             40 * (win_pct - 0.5)
             + 1.25 * max(-14, min(14, pdpg))
             + 8 * (form - 0.5)
+            + 1.5 * max(-3, min(3, rest_diff))
         )
 
     @staticmethod
-    def legacy_score(team, opponent, home):
-        # Faithful recreation of the original name-signature heuristic.
+    def legacy_score(team, opponent, home, rest_home, rest_away):
         def mass(name):
             return 13000 + sum(map(ord, name)) % 850
 
@@ -127,28 +145,14 @@ class Backtest:
             return (sum(map(ord, name)) * 3) % 45
 
         def prestige(name):
-            # Original registry used full team names. These aliases
-            # preserve the original coefficients.
-            full_names = {
-                "NE": "New England Patriots",
-                "KC": "Kansas City Chiefs",
-                "SF": "San Francisco 49ers",
-                "PIT": "Pittsburgh Steelers",
-                "DAL": "Dallas Cowboys",
-                "GB": "Green Bay Packers",
-                "DEN": "Denver Broncos",
-                "SEA": "Seattle Seahawks",
-                "PHI": "Philadelphia Eagles",
-                "BAL": "Baltimore Ravens",
-                "BUF": "Buffalo Bills",
-            }
-            return DYNASTY.get(team, 1.0)
+            return DYNASTY.get(name, 1.0)
 
-        def env(name, is_home):
+        def env(name, is_home, rest_days):
             friction = 12 if is_home and name in COLD_TEAMS else (
                 -5 if not is_home else 0
             )
-            travel = 10 if is_home else -15
+            # Upgraded Axiom VI: Dynamic travel entropy offset by rest adjustment
+            travel = (10 if is_home else -15) + (rest_days - 7) * 1.5
             return friction + travel
 
         mass_diff = (mass(team) - mass(opponent)) * 0.04
@@ -159,23 +163,21 @@ class Backtest:
 
         score_team = (
             100 + mass_diff + altitude_team + momentum_diff
-            + env(team, home)
+            + env(team, home, rest_home)
         ) * prestige(team)
 
         score_opp = (
             100 - mass_diff + altitude_opp - momentum_diff
-            + env(opponent, not home)
+            + env(opponent, not home, rest_away)
         ) * prestige(opponent)
 
         return score_team, score_opp
 
     def record(self, season, model, probability, actual):
-        # actual = 1 for home win, 0 for away win, 0.5 for a tie.
         r = self.results[season][model]
         r["n"] += 1
         r["brier"] += (probability - actual) ** 2
 
-        # Ties contribute to Brier score but not winner accuracy.
         if actual != 0.5:
             r.setdefault("decisive", 0)
             r.setdefault("correct_decisive", 0)
@@ -188,26 +190,31 @@ class Backtest:
 
     def evaluate_game(self, g):
         home, away = g["home"], g["away"]
+        game_date = g["date"]
 
-        # Actual outcome is used only for scoring after predictions.
+        # Calculate rest days since last game (default to 7 if opening week / unknown)
+        rest_home = (game_date - self.last_played[home]).days if home in self.last_played else 7
+        rest_away = (game_date - self.last_played[away]).days if away in self.last_played else 7
+        rest_diff = rest_home - rest_away
+
         actual = (
             1.0 if g["hs"] > g["aws"]
             else 0.0 if g["hs"] < g["aws"]
             else 0.5
         )
 
-        # Model A: original Infinity heuristic.
-        hs, aws = self.legacy_score(home, away, True)
+        # Model A: Legacy Infinity Heuristic (with dynamic rest update)
+        hs, aws = self.legacy_score(home, away, True, rest_home, rest_away)
         p_legacy = logistic((hs - aws) / 10.0)
 
-        # Model B: performance-based heuristic.
+        # Model B: Performance & Rest Heuristic
         rating_diff = (
-            self.revised_rating(home) - self.revised_rating(away) + 2.0
+            self.revised_rating(home, rest_diff) - self.revised_rating(away, -rest_diff) + 2.0
         )
         p_revised = logistic(rating_diff / 7.0)
 
-        # Model C: Elo with a 55-point home advantage.
-        elo_diff = self.elo[home] + 55.0 - self.elo[away]
+        # Model C: Elo with home-field advantage & Rest differential adjustment
+        elo_diff = self.elo[home] + 55.0 + (rest_diff * 4.0) - self.elo[away]
         p_elo = 1.0 / (1.0 + 10 ** (-elo_diff / 400.0))
 
         season = g["season"]
@@ -216,7 +223,11 @@ class Backtest:
             self.record(season, "Revised", p_revised, actual)
             self.record(season, "Elo", p_elo, actual)
 
-        # Only after predictions are scored do we update team data.
+        # Update last played date
+        self.last_played[home] = game_date
+        self.last_played[away] = game_date
+
+        # Update team statistics trackers
         sh = self.stats[home]
         sa = self.stats[away]
 
@@ -243,8 +254,13 @@ class Backtest:
             sh["recent"].append(0.5)
             sa["recent"].append(0.5)
 
-        # Standard Elo update; margin multiplier is deliberately omitted.
-        k = 20.0
+        # Upgraded Elo with Margin-of-Victory (MOV) Multiplier
+        point_diff = abs(g["hs"] - g["aws"])
+        mov_multiplier = math.log(max(point_diff, 1) + 1.0) * (
+            2.2 / (float(abs(self.elo[home] - self.elo[away])) * 0.001 + 2.2)
+        )
+        k = 20.0 * mov_multiplier
+        
         self.elo[home] += k * (actual - p_elo)
         self.elo[away] += k * ((1.0 - actual) - (1.0 - p_elo))
 
@@ -256,10 +272,10 @@ class Backtest:
         for g in games:
             self.evaluate_game(g)
 
-        print("\nNFL INFINITY HISTORICAL BACKTEST")
+        print("\n=== NFL INFINITY ADVANCED BACKTEST ===")
         print(f"Evaluation seasons: {FIRST_TEST_SEASON}-{LAST_TEST_SEASON}")
-        print(f"Completed regular-season rows processed: {len(games)}")
-        print("All models predict before updating with each game's result.\n")
+        print(f"Total regular-season games processed: {len(games)}")
+        print("Chronological validation complete with Rest Tracking & MOV Elo.\n")
 
         models = ["Legacy", "Revised", "Elo"]
         totals = {
@@ -297,7 +313,7 @@ class Backtest:
                 totals[model]["decisive"] += decisive
                 totals[model]["brier"] += r["brier"]
 
-        print("\nOVERALL")
+        print("\n=== OVERALL PERFORMANCE ===")
         for model in models:
             t = totals[model]
             if not t["n"]:
@@ -315,10 +331,8 @@ class Backtest:
 
         print("\nInterpretation:")
         print("- Higher accuracy is better for winner picks.")
-        print("- Lower Brier score is better for probabilities.")
-        print("- Brier 0.25 is the 50/50 probability baseline.")
-        print("- Weights were not optimized on the test seasons.")
-        print("- This test covers regular-season games, not playoff brackets.")
+        print("- Lower Brier score is better for calibrated probabilities.")
+        print("- Brier 0.25 represents a random coin-flip baseline.")
 
 
 if __name__ == "__main__":
@@ -326,4 +340,4 @@ if __name__ == "__main__":
         Backtest().run()
     except Exception as exc:
         print(f"Backtest failed: {exc}")
-        print("Check the dataset URL and your internet connection.")
+        print("Check your internet connection and permissions.")
